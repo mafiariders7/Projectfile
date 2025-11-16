@@ -387,14 +387,28 @@ public:
                 }
             }
         } else if (state == 2) {
-            // TRANSLATE ONCE: Overlap section (executed once per outer iteration)
-            cout << "State 2: Translating overlap TB (outer epilog + next inner prolog with SPMASK)" << endl;
-            TranslationBlock tb2 = translateNestedOverlap();
-            translation_blocks.push_back(tb2);
-            cout << "Generated TB" << tb2.tb_id << " for state 2 (overlap section)" << endl;
+            // Check if we already have a state 2 TB (reuse it)
+            int state2_tb_id = -1;
+            for (const auto& tb : translation_blocks) {
+                if (tb.start_label == "NESTED_STATE_2") {
+                    state2_tb_id = tb.tb_id;
+                    break;
+                }
+            }
+            
+            if (state2_tb_id == -1) {
+                // TRANSLATE ONCE: Overlap section (first time in state 2)
+                cout << "State 2: Translating overlap TB (outer epilog + next inner prolog with SPMASK)" << endl;
+                TranslationBlock tb2 = translateNestedOverlap();
+                translation_blocks.push_back(tb2);
+                state2_tb_id = tb2.tb_id;
+                cout << "Generated TB" << state2_tb_id << " for state 2 (overlap section)" << endl;
+            } else {
+                cout << "State 2: Re-using existing overlap TB" << state2_tb_id << endl;
+            }
             
             cout << "\n--- Executing State 2 TB (Overlap) ---" << endl;
-            cout << "Overlap: Executing TB" << tb2.tb_id << " (state 2 - synchronizing loops)" << endl;
+            cout << "Overlap: Executing TB" << state2_tb_id << " (state 2 - synchronizing loops)" << endl;
             
             // After overlap, the inner loop restarts
             cout << "\n--- Executing State 0 TB (Prolog of new inner loop) ---" << endl;
@@ -514,7 +528,7 @@ public:
         tb.start_label = "NESTED_STATE_0";
         
         cout << "  Translating prolog instructions into TB" << tb.tb_id << ":" << endl;
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < sploop_start_index; i++) {
             if (i < guest_code.size()) {
                 tb.packets.push_back(guest_code[i]);
                 cout << "    EP" << guest_code[i].ep_num << ": ";
@@ -538,17 +552,30 @@ public:
         tb.tb_id = current_tb_id++;
         tb.start_label = "NESTED_STATE_1";
         
-        cout << "  Translating inner loop body into TB" << tb.tb_id << " (skip SPMASK):" << endl;
-        for (size_t i = 6; i < min((size_t)12, guest_code.size()); i++) {
-            // Skip EPs containing SPMASK
+        cout << "  Translating inner loop body into TB" << tb.tb_id << " (kernel only):" << endl;
+        
+        // Inner loop body: from sploop_start_index until we hit BRANCH or SPMASK
+        for (size_t i = sploop_start_index; i < guest_code.size(); i++) {
+            // Check if this EP contains SPMASK or BRANCH (end of kernel)
             bool has_spmask = false;
+            bool has_branch = false;
+            
             for (const auto& insn : guest_code[i].instructions) {
                 if (insn.type == SPMASK) {
                     has_spmask = true;
-                    break;
+                }
+                if (insn.type == BRANCH) {
+                    has_branch = true;
                 }
             }
             
+            // Stop at BRANCH (marks end of inner kernel)
+            if (has_branch) {
+                cout << "    EP" << guest_code[i].ep_num << ": [SKIPPED - end of kernel (BRANCH)]" << endl;
+                break;
+            }
+            
+            // Skip SPMASK
             if (has_spmask) {
                 cout << "    EP" << guest_code[i].ep_num << ": [SKIPPED - contains SPMASK]" << endl;
                 continue;
@@ -755,10 +782,11 @@ public:
         // Initialize nested loop parameters
         ILC = 7;    // From line 1: MVK .S 7, A8 -> MVC .S A8, ILC
         RILC = 7;   // From line 3: MVC .S A8, RILC
-        A1 = 1;     // From line 4: MVK .S 1, A1 (outer loop counter, simplified to 3 iterations for demo)
+        A1 = 3;     // Set to 3 for demonstration of nested loop with overlap (originally MVK .S 1, A1 but we need multiple outer iterations)
         state = 0;
         
         cout << "\nInitial values: ILC=" << ILC << ", RILC=" << RILC << ", A1=" << A1 << endl;
+        cout << "Note: A1 set to 3 (instead of 1) to demonstrate nested loop overlap section (EP12-EP15)" << endl;
         cout << "\nSimulating nested loop with proper state transitions:" << endl;
         
         // Call once per outer iteration - each call handles all inner iterations
