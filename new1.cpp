@@ -60,6 +60,7 @@ private:
     int RILC;   // Reload Inner Loop Counter
     int state;  // State for software-pipelined loops
     int A1;     // Outer loop counter
+    int sploop_start_index; // Index where SPLOOP starts
     
     // Store instruction deferred translation
     struct DeferredStore {
@@ -70,7 +71,7 @@ private:
     vector<DeferredStore> deferred_stores;
 
 public:
-    VLIWSimulator() : current_tb_id(0), ILC(0), RILC(0), state(0), A1(0) {
+    VLIWSimulator() : current_tb_id(0), ILC(0), RILC(0), state(0), A1(0), sploop_start_index(-1) {
         registers["B1"] = 5;
         registers["B3"] = 0;
         registers["A10"] = 100;
@@ -132,11 +133,13 @@ public:
     
     void parseSoftwarePipelinedLoop() {
         guest_code.clear();
+        sploop_start_index = -1;
         
         addEP(1, 1, createInstruction(ARITHMETIC, "MVK", ".S", 0, "8, A0", 1));
         addEP(2, 1, createInstruction(ARITHMETIC, "MVC", ".S", 0, "A0, ILC", 2));
         addEP(3, 3, createInstruction(NOP, "NOP", "", 0, "3", 3));
         addEP(4, 1, createInstruction(SPLOOP, "SPLOOP", "", 0, "1", 4));
+        sploop_start_index = 4; // EP5 is where the pipelined body starts (index 4 in 0-based)
         addEP(5, 1, createInstruction(LOAD, "LDW", ".D", 4, "*A1++, A2", 5));
         addEP(6, 4, createInstruction(NOP, "NOP", "", 0, "4", 6));
         addEP(7, 1, createInstruction(ARITHMETIC, "MV", ".L1X", 0, "A2, B2", 7));
@@ -150,6 +153,7 @@ public:
     
     void parseNestedSoftwarePipelinedLoop() {
         guest_code.clear();
+        sploop_start_index = -1;
         
         addEP(1, 1, createInstruction(ARITHMETIC, "MVK", ".S", 0, "7, A8", 1));
         addEP(2, 1, createInstruction(ARITHMETIC, "MVC", ".S", 0, "A8, ILC", 2));
@@ -157,6 +161,7 @@ public:
         addEP(4, 1, createInstruction(ARITHMETIC, "MVK", ".S", 0, "1, A1", 4));
         addEP(5, 3, createInstruction(NOP, "NOP", "", 0, "3", 5));
         addEP(6, 1, createInstruction(SPLOOP, "SPLOOP", "", 0, "1", 6, "[A1]"));
+        sploop_start_index = 6; // EP7 starts the pipelined body (index 6 in 0-based)
         addEP(7, 1, createInstruction(LOAD, "LDW", ".D1", 0, "*A4++, A0", 7));
         addEP(8, 4, createInstruction(NOP, "NOP", "", 0, "4", 8));
         addEP(9, 1, createInstruction(ARITHMETIC, "MV", ".L2X", 0, "A0, B0", 9));
@@ -189,12 +194,12 @@ public:
         tb.max_cycles = initial_cycles;
         tb.start_ep_index = start_ep;
         
-        int cycles = initial_cycles;
-        int ep_index = start_ep;
-        
         cout << "\n=== TB-Length Constraint Strategy ===" << endl;
         cout << "Translating TB" << tb.tb_id << " starting from EP" << (start_ep + 1) 
              << " with max cycles: " << initial_cycles << endl;
+        
+        int cycles = initial_cycles;
+        int ep_index = start_ep;
         
         while (ep_index < guest_code.size() && cycles > 0) {
             ExecutePacket ep = guest_code[ep_index];
@@ -305,16 +310,16 @@ public:
                 cout << "\nTransitioning to state 1 for subsequent iterations" << endl;
                 
                 // TRANSLATE ONCE for state 1 (this TB will be executed ILC times)
-                cout << "\nState 1: Translating loop body TB (skip masked, will be executed " << ILC << " times)" << endl;
-                TranslationBlock tb1 = translateMaskedLoop();
+                cout << "\nState 1: Translating loop kernel TB (skip prolog, will be executed " << ILC << " times)" << endl;
+                TranslationBlock tb1 = translateKernelLoop();
                 translation_blocks.push_back(tb1);
                 cout << "Generated TB" << tb1.tb_id << " for state 1 (reusable)" << endl;
                 
                 // Now EXECUTE the state 1 TB multiple times (without re-translating)
-                cout << "\n--- Executing State 1 TB (Loop Body) ---" << endl;
+                cout << "\n--- Executing State 1 TB (Loop Kernel) ---" << endl;
                 for (int i = 1; i <= ILC; i++) {
                     cout << "Iteration " << (i + 1) << ": Executing TB" << tb1.tb_id 
-                         << " (state 1 - masked instructions skipped, ILC=" << (ILC - i + 1) << ")" << endl;
+                         << " (state 1 - kernel only, ILC=" << (ILC - i + 1) << ")" << endl;
                 }
                 ILC = 0; // All iterations completed
                 state = 0;
@@ -471,71 +476,35 @@ public:
         return tb;
     }
 
-    TranslationBlock translateMaskedLoop() {
+    TranslationBlock translateKernelLoop() {
         TranslationBlock tb;
         tb.tb_id = current_tb_id++;
         tb.start_label = "LOOP_STATE_1";
         
-        cout << "  Translating EPs into TB" << tb.tb_id << " (excluding masked):" << endl;
+        cout << "  Translating kernel EPs into TB" << tb.tb_id << " (skip prolog):" << endl;
+        
+        // For simple software-pipelined loops, skip setup instructions (before SPLOOP)
+        // and include only the pipelined kernel body
         for (size_t i = 0; i < guest_code.size(); i++) {
-            ExecutePacket ep = guest_code[i];
-            bool has_masked = false;
-            for (const auto& insn : ep.instructions) {
-                if (insn.type == SPMASK) {
-                    has_masked = true;
-                    break;
-                 }
+            // Skip prolog (instructions before SPLOOP body)
+            if (sploop_start_index >= 0 && (int)i < sploop_start_index) {
+                cout << "    EP" << guest_code[i].ep_num << ": [SKIPPED - prolog]" << endl;
+                continue;
             }
-            if (!has_masked) {
-                tb.packets.push_back(ep);
-                cout << "\tEP" << ep.ep_num << ": ";
-                for (const auto& insn : ep.instructions) {
-                    if (insn.parallel) cout << "|| ";
-                    cout << insn.mnemonic;
-                    if (!insn.operands.empty()) cout << " " << insn.operands;
-                    cout << " ";
-                }
-                cout << endl;
-            } else {
-                cout << "\tEP" << ep.ep_num << ": [SKIPPED - contains SPMASK]" << endl;
+            
+            tb.packets.push_back(guest_code[i]);
+            cout << "    EP" << guest_code[i].ep_num << ": ";
+            for (const auto& insn : guest_code[i].instructions) {
+                if (insn.parallel) cout << "|| ";
+                cout << insn.mnemonic;
+                if (!insn.operands.empty()) cout << " " << insn.operands;
+                cout << " ";
             }
+            cout << endl;
         }
         
         cout << "  Generated TB" << tb.tb_id << " with " 
-             << tb.packets.size() << " EPs (masked excluded)" << endl;
-        return tb;
-    }
-
-    TranslationBlock translateSyncLoop() {
-        TranslationBlock tb;
-        tb.tb_id = current_tb_id++;
-        tb.start_label = "LOOP_STATE_2";
-        
-        cout << "  Synchronously translating inner and outer loops into TB" << tb.tb_id << endl;
-        cout << "  Overlapping instructions from both loops:" << endl;
-        
-        if (guest_code.size() >= 2) {
-            tb.packets.push_back(guest_code[0]);
-            tb.packets.push_back(guest_code[1]);
-            cout << "    EP" << guest_code[0].ep_num << ": ";
-            for (const auto& insn : guest_code[0].instructions) {
-                if (insn.parallel) cout << "|| ";
-                cout << insn.mnemonic;
-                if (!insn.operands.empty()) cout << " " << insn.operands;
-                cout << " ";
-            }
-            cout << endl;
-            cout << "    EP" << guest_code[1].ep_num << ": ";
-            for (const auto& insn : guest_code[1].instructions) {
-                if (insn.parallel) cout << "|| ";
-                cout << insn.mnemonic;
-                if (!insn.operands.empty()) cout << " " << insn.operands;
-                cout << " ";
-            }
-            cout << endl;
-        }
-        
-        cout << "  Generated TB" << tb.tb_id << " with synchronized loops" << endl;
+             << tb.packets.size() << " EPs (kernel only)" << endl;
         return tb;
     }
 
@@ -569,8 +538,22 @@ public:
         tb.tb_id = current_tb_id++;
         tb.start_label = "NESTED_STATE_1";
         
-        cout << "  Translating inner loop body into TB" << tb.tb_id << ":" << endl;
-        for (size_t i = 6; i < min((size_t)10, guest_code.size()); i++) {
+        cout << "  Translating inner loop body into TB" << tb.tb_id << " (skip SPMASK):" << endl;
+        for (size_t i = 6; i < min((size_t)12, guest_code.size()); i++) {
+            // Skip EPs containing SPMASK
+            bool has_spmask = false;
+            for (const auto& insn : guest_code[i].instructions) {
+                if (insn.type == SPMASK) {
+                    has_spmask = true;
+                    break;
+                }
+            }
+            
+            if (has_spmask) {
+                cout << "    EP" << guest_code[i].ep_num << ": [SKIPPED - contains SPMASK]" << endl;
+                continue;
+            }
+            
             tb.packets.push_back(guest_code[i]);
             cout << "    EP" << guest_code[i].ep_num << ": ";
             for (const auto& insn : guest_code[i].instructions) {
@@ -620,10 +603,6 @@ public:
             if (ctx.remaining_delay < min_delay) {
                 min_delay = ctx.remaining_delay;
             }
-        }
-        
-        for (auto& ctx : saved_contexts) {
-            ctx.remaining_delay--;
         }
         
         saved_contexts.erase(
@@ -676,21 +655,23 @@ public:
         int start_ep_tb2 = getNextStartEP();
         TranslationBlock tb2 = translateWithConstraint(start_ep_tb2, cycles_for_tb2);
         translation_blocks.push_back(tb2);
+
+
         
-        if (tb2.packets.size() > 0) {
-            cout << "\n--- After TB1 execution ---" << endl;
-            int cycles_for_tb3 = getCyclesFromPrecedingTB();
-            cout << "Minimum remaining delay from TB1: " << cycles_for_tb3 << " cycles" << endl;
+       
+        cout << "\n--- After TB1 execution ---" << endl;
+        int cycles_for_tb3 = getCyclesFromPrecedingTB();
+        cout << "Minimum remaining delay from TB1: " << cycles_for_tb3 << " cycles" << endl;
             
-            int next_ep_index = getNextStartEP();
-            if (next_ep_index < guest_code.size()) {
+        int next_ep_index = getNextStartEP(); 
+        if (next_ep_index < guest_code.size()) {
                 cout << "\n--- Translating TB2 (remaining instructions) ---" << endl;
                 TranslationBlock tb3 = translateWithConstraint(next_ep_index, cycles_for_tb3);
                 translation_blocks.push_back(tb3);
-            } else {
+        } else {
                 cout << "\n--- No more EPs to translate ---" << endl;
-            }
         }
+        
         
         cout << "\n\n********** PART 2: Parallel LD/ST Handling (Figure 3) **********\n" << endl;
         ExecutePacket parallel_ep;
